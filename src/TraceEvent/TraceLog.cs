@@ -25,6 +25,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.Tracing;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -154,11 +155,32 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// </summary>
         public static TraceLogEventSource CreateFromTraceEventSession(TraceEventSession session)
         {
+            return CreateFromTraceEventSession(session, 1000);
+        }
+
+        /// <summary>
+        /// From a TraceEventSession, create a real time TraceLog Event Source.   Like a ETWTraceEventSource a TraceLogEventSource
+        /// will deliver events in real time.   However an TraceLogEventSource has an underlying Tracelog (which you can access with
+        /// the .Log Property) which lets you get at aggregated information (Processes, threads, images loaded, and perhaps most
+        /// importantly TraceEvent.CallStack() will work.  Thus you can get real time stacks from events).
+        ///
+        /// Note that in order for native stacks to resolve symbolically, you need to have some Kernel events turned on (Image, and Process)
+        /// and only windows 8 has a session that allows both kernel and user mode events simultaneously.   Thus this is most useful
+        /// on Win 8 systems.
+        /// </summary>
+        /// <param name="minDispatchDelayMSec">The delay in milliseconds between when an event is received in TraceLog and when it is dispatched to the real time event source.</param>
+        public static TraceLogEventSource CreateFromTraceEventSession(TraceEventSession session, int minDispatchDelayMSec)
+        {
+            if (minDispatchDelayMSec < 10)
+            {
+                throw new ArgumentOutOfRangeException(nameof(minDispatchDelayMSec), "The minimum dispatch delay is too small.");
+            }
+
             var traceLog = new TraceLog(session.Source);
             traceLog.pointerSize = ETWTraceEventSource.GetOSPointerSize();
 
             traceLog.realTimeQueue = new Queue<QueueEntry>();
-            traceLog.realTimeFlushTimer = new Timer(_ => traceLog.FlushRealTimeEvents(1000), null, 1000, 1000);
+            traceLog.realTimeFlushTimer = new Timer(_ => traceLog.FlushRealTimeEvents(minDispatchDelayMSec), null, minDispatchDelayMSec, minDispatchDelayMSec);
             traceLog.rawEventSourceToConvert.AllEvents += traceLog.onAllEventsRealTime;
 
             // See if we are on Win7 and have a separate kernel session associated with 'session'
@@ -213,7 +235,9 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                 // rundown events and shut down immediately and feed this as an additional session to the TraceLog.
                 // Note: it doesn't matter what the actual provider is, just that we request rundown in the constructor.
                 using (var rundownSession = rundownDiagnosticsClient.StartEventPipeSession(
-                    new EventPipeProvider(ClrTraceEventParser.ProviderName, EventLevel.Informational, (long)ClrTraceEventParser.Keywords.Default),
+                    rundownConfiguration.m_providers?.AsEnumerable() ?? new[]{
+                        new EventPipeProvider(ClrTraceEventParser.ProviderName, EventLevel.Informational, (long)ClrTraceEventParser.Keywords.Default)
+                    },
                     requestRundown: true
                 ))
                 {
@@ -230,6 +254,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         public class EventPipeRundownConfiguration
         {
             internal readonly DiagnosticsClient m_client;
+            internal List<EventPipeProvider> m_providers;
 
             private EventPipeRundownConfiguration(DiagnosticsClient client) { m_client = client; }
 
@@ -250,6 +275,20 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             public static EventPipeRundownConfiguration Enable(DiagnosticsClient client)
             {
                 return new EventPipeRundownConfiguration(client);
+            }
+
+            /// <summary>
+            /// Adds a provider to use when initializing the rundown session.
+            /// The first call resets the list, removing the default provider (CLR).
+            /// You can use this if you need to tune the event level, keywords, etc.
+            /// </summary>
+            public void AddProvider(EventPipeProvider provider)
+            {
+                if (m_providers == null)
+                {
+                    m_providers = new List<EventPipeProvider>();
+                }
+                m_providers.Add(provider);
             }
         }
 
@@ -749,6 +788,25 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             rawEventSourceToConvert = source;
             SetupCallbacks(rawEventSourceToConvert);
             rawEventSourceToConvert.unhandledEventTemplate.traceEventSource = this;       // Make everything point to the log as its source.
+
+            // Self describing metadata doesn't make it to realTimeSource because TraceLog overwrites the event's extended data.
+            // To address this, we use the event from the raw source, which contains the metadata,
+            // and convert it to a template that can be registered with realTimeSource.
+            realTimeSource.RegisterUnhandledEventImpl(te =>
+            {
+                var toSend = realTimeEvent;
+                if (toSend == null)
+                {
+                    return false;
+                }
+                if (toSend.containsSelfDescribingMetadata)
+                {
+                    var template = toSend.CloneToTemplate();
+                    realTimeSource.Dynamic.OnNewEventDefintion(template, true);
+                    return true;
+                }
+                return false;
+            });
         }
 
         private unsafe void onAllEventsRealTime(TraceEvent data)
@@ -813,24 +871,20 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// </summary>
         private unsafe void DispatchClonedEvent(TraceEvent toSend)
         {
-            // Self describing metadata doesn't make it to realTimeSource because TraceLog overwrites the event's extended data.
-            // To address this, we use the event from the raw source, which contains the metadata,
-            // and convert it to a template that can be registered with realTimeSource.
-            realTimeSource.RegisterUnhandledEventImpl(te =>
+            realTimeEvent = toSend;
+            TraceEvent eventInRealTimeSource = null;
+            try
             {
-                if (toSend.containsSelfDescribingMetadata)
-                {
-                    var template = toSend.CloneToTemplate();
-                    realTimeSource.Dynamic.OnNewEventDefintion(template, true);
-                    return true;
-                }
-                return false;
-            });
-            TraceEvent eventInRealTimeSource = realTimeSource.Lookup(toSend.eventRecord);
-            eventInRealTimeSource.userData = toSend.userData;
-            eventInRealTimeSource.eventIndex = toSend.eventIndex;           // Lookup assigns the EventIndex, but we want to keep the original.
-            eventInRealTimeSource.myBuffer = toSend.myBuffer;
-            realTimeSource.Dispatch(eventInRealTimeSource);
+                eventInRealTimeSource = realTimeSource.Lookup(toSend.eventRecord);
+                eventInRealTimeSource.userData = toSend.userData;
+                eventInRealTimeSource.eventIndex = toSend.eventIndex;           // Lookup assigns the EventIndex, but we want to keep the original.
+                eventInRealTimeSource.myBuffer = toSend.myBuffer;
+                realTimeSource.Dispatch(eventInRealTimeSource);
+            }
+            finally
+            {
+                realTimeEvent = null;
+            }
 
             // Optimization, remove 'toSend' from the finalization queue.
             Debug.Assert(toSend.myBuffer != IntPtr.Zero);
@@ -846,47 +900,65 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// </summary>
         internal void FlushRealTimeEvents(int minimumAgeMs = 0)
         {
-            lock (realTimeQueue)
+            // we need to guard our data structures from concurrent access.  TraceLog data
+            // is modified by this code as well as code in FlushRealTimeEvents.
+            if (!isFlushingRealTimeEvents)
             {
-                var nowTicks = Environment.TickCount;
-                // TODO review.
-                while (realTimeQueue.Count > 0)
+                lock (realTimeQueue)
                 {
-                    QueueEntry entry = realTimeQueue.Peek();
-                    // If it has been in the queue less than 1 second, we we wait until next time) & 3FFFFFF does wrap around subtraction.
-                    if (minimumAgeMs > 0 && ((nowTicks - entry.enqueueTick) & 0x3FFFFFFF) < minimumAgeMs)
+                    isFlushingRealTimeEvents = true;
+                    try
                     {
-                        break;
+                        FlushRealTimeEventsNoLock(minimumAgeMs);
                     }
-
-                    DispatchClonedEvent(entry.data);
-                    realTimeQueue.Dequeue();
+                    finally
+                    {
+                        isFlushingRealTimeEvents = false;
+                    }
                 }
+            }
+        }
 
-                // Try to keep our memory under control by removing old data.
-                // Lots of data structures in TraceLog can grow over time.
-                // However currently we only trim three, all CAN grow on every event (so they grow most quickly of all data structures)
-                // and we know they are not needed after dispatched the events they are for.
-
-                // To keep overhead reasonable, we assume the worst case (every event has an entry) and we allow the tables to grow
-                // to 3X what is needed, and then we slide down the 1X of entries we need.
-                // We could be more accurate, but this at least keeps THESE arrays under control.
-                int MaxEventCountBeforeReset = Math.Max(realTimeQueue.Count * 3, 1000);
-
-                if (eventsToStacks.Count > MaxEventCountBeforeReset)
+        private void FlushRealTimeEventsNoLock(int minimumAgeMs)
+        {
+            var nowTicks = Environment.TickCount;
+            // TODO review.
+            while (realTimeQueue.Count > 0)
+            {
+                QueueEntry entry = realTimeQueue.Peek();
+                // If it has been in the queue less than 1 second, we we wait until next time) & 3FFFFFF does wrap around subtraction.
+                if (minimumAgeMs > 0 && ((nowTicks - entry.enqueueTick) & 0x3FFFFFFF) < minimumAgeMs)
                 {
-                    RemoveAllButLastEntries(ref eventsToStacks, realTimeQueue.Count);
+                    break;
                 }
 
-                if (eventsToCodeAddresses.Count > MaxEventCountBeforeReset)
-                {
-                    RemoveAllButLastEntries(ref eventsToCodeAddresses, realTimeQueue.Count);
-                }
+                DispatchClonedEvent(entry.data);
+                realTimeQueue.Dequeue();
+            }
 
-                if (cswitchBlockingEventsToStacks.Count > MaxEventCountBeforeReset)
-                {
-                    RemoveAllButLastEntries(ref cswitchBlockingEventsToStacks, realTimeQueue.Count);
-                }
+            // Try to keep our memory under control by removing old data.
+            // Lots of data structures in TraceLog can grow over time.
+            // However currently we only trim three, all CAN grow on every event (so they grow most quickly of all data structures)
+            // and we know they are not needed after dispatched the events they are for.
+
+            // To keep overhead reasonable, we assume the worst case (every event has an entry) and we allow the tables to grow
+            // to 3X what is needed, and then we slide down the 1X of entries we need.
+            // We could be more accurate, but this at least keeps THESE arrays under control.
+            int MaxEventCountBeforeReset = Math.Max(realTimeQueue.Count * 3, 1000);
+
+            if (eventsToStacks.Count > MaxEventCountBeforeReset)
+            {
+                RemoveAllButLastEntries(ref eventsToStacks, realTimeQueue.Count);
+            }
+
+            if (eventsToCodeAddresses.Count > MaxEventCountBeforeReset)
+            {
+                RemoveAllButLastEntries(ref eventsToCodeAddresses, realTimeQueue.Count);
+            }
+
+            if (cswitchBlockingEventsToStacks.Count > MaxEventCountBeforeReset)
+            {
+                RemoveAllButLastEntries(ref cswitchBlockingEventsToStacks, realTimeQueue.Count);
             }
         }
 
@@ -4445,6 +4517,8 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
 
         internal TraceLogEventSource realTimeSource;               // used to call back in real time case.
         private Queue<QueueEntry> realTimeQueue;                   // We have to wait a bit to hook up stacks, so we put real time entries in the queue
+        private TraceEvent realTimeEvent;                          // The current event being processed.
+        private bool isFlushingRealTimeEvents;                     // Are we in the middle of dispatching the real time events.
 
         // These can ONLY be accessed by the thread calling RealTimeEventSource.Process();
         private Timer realTimeFlushTimer;                          // Ensures the queue gets flushed even if there are no incoming events.
